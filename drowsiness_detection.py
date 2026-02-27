@@ -9,7 +9,6 @@ import time
 import warnings
 warnings.filterwarnings('ignore')
 
-print("hello")
 # Eye Aspect Ratio calculation
 def eye_aspect_ratio(eye):
     """
