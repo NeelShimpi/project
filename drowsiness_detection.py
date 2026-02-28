@@ -22,6 +22,25 @@ def eye_aspect_ratio(eye):
     return ear
 
 
+# Mouth Aspect Ratio calculation
+def mouth_aspect_ratio(mouth):
+    """
+    Calculate the Mouth Aspect Ratio (MAR)
+    Uses the inner lip landmarks (points 60-67 in dlib's 68 landmark model)
+    MAR = (||p2-p8|| + ||p3-p7|| + ||p4-p6||) / (2 * ||p1-p5||)
+    
+    A high MAR value indicates an open mouth (yawn).
+    """
+    # Vertical distances (inner lip top to bottom)
+    A = dist.euclidean(mouth[13], mouth[19])  # 61 -> 67
+    B = dist.euclidean(mouth[14], mouth[18])  # 62 -> 66
+    C = dist.euclidean(mouth[15], mouth[17])  # 63 -> 65
+    # Horizontal distance
+    D = dist.euclidean(mouth[12], mouth[16])  # 60 -> 64
+    mar = (A + B + C) / (2.0 * D)
+    return mar
+
+
 class DrowsinessDetector:
     def __init__(self, 
                  haar_cascade_path='haarcascade_frontalface_default.xml',
@@ -57,11 +76,21 @@ class DrowsinessDetector:
         self.LEFT_EYE_START, self.LEFT_EYE_END = 42, 48
         self.RIGHT_EYE_START, self.RIGHT_EYE_END = 36, 42
         
+        # Mouth indices for 68-point facial landmarks (outer + inner lips)
+        self.MOUTH_START, self.MOUTH_END = 48, 68
+        
         # EAR thresholds
         self.EAR_THRESHOLD = 0.25
         self.EAR_CONSEC_FRAMES = 20
         self.frame_counter = 0
         self.drowsy_flag = False
+        
+        # MAR (yawn) thresholds
+        self.MAR_THRESHOLD = 0.75       # Mouth open ratio threshold for yawn
+        self.YAWN_CONSEC_FRAMES = 15    # Consecutive frames mouth must be open
+        self.yawn_frame_counter = 0
+        self.yawn_flag = False
+        self.total_yawns = 0
         
         # Load Vision Transformer model
         from vit_model import VisionTransformerDrowsiness
@@ -88,6 +117,7 @@ class DrowsinessDetector:
         self.total_frames = 0
         self.drowsy_frames = 0
         self.alert_frames = 0
+        self.yawn_frames = 0
         self.true_positives = 0
         self.true_negatives = 0
         self.false_positives = 0
@@ -95,6 +125,7 @@ class DrowsinessDetector:
         
         # Performance metrics
         self.ear_history = []
+        self.mar_history = []
         self.vit_confidence_history = []
         self.detection_accuracy = 0.0
         
@@ -161,6 +192,68 @@ class DrowsinessDetector:
         return frame, is_drowsy
     
     
+    def detect_yawn(self, frame):
+        """
+        Detect yawning using Mouth Aspect Ratio (MAR)
+        
+        The MAR is computed from the inner lip landmarks of dlib's
+        68-point facial landmark model. When the mouth opens wide
+        (as in a yawn), the MAR exceeds MOUTH_AR_THRESHOLD.
+        
+        Args:
+            frame: Input video frame
+            
+        Returns:
+            frame: Annotated frame with mouth contour and yawn status
+            is_yawning: Boolean indicating whether a yawn is detected
+            mar_value: The current Mouth Aspect Ratio value
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self.face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        is_yawning = False
+        mar_value = 0.0
+        
+        for (x, y, w, h) in faces:
+            if self.predictor is None:
+                continue
+            
+            # Get facial landmarks
+            rect = dlib.rectangle(int(x), int(y), int(x + w), int(y + h))
+            shape = self.predictor(gray, rect)
+            shape = face_utils.shape_to_np(shape)
+            
+            # Extract mouth coordinates (points 48-67)
+            mouth = shape[self.MOUTH_START:self.MOUTH_END]
+            
+            # Calculate MAR
+            mar_value = mouth_aspect_ratio(mouth)
+            
+            # Draw mouth contour
+            mouth_hull = cv2.convexHull(mouth)
+            cv2.drawContours(frame, [mouth_hull], -1, (255, 0, 255), 1)
+            
+            # Check for yawn
+            if mar_value > self.MAR_THRESHOLD:
+                self.yawn_frame_counter += 1
+                
+                if self.yawn_frame_counter >= self.YAWN_CONSEC_FRAMES:
+                    is_yawning = True
+                    self.yawn_flag = True
+                    self.total_yawns += 1
+                    cv2.putText(frame, "YAWN DETECTED!", (10, 160),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            else:
+                self.yawn_frame_counter = 0
+                self.yawn_flag = False
+            
+            # Display MAR value near the face
+            cv2.putText(frame, f"MAR: {mar_value:.2f}", (x, y + h + 20),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+        
+        return frame, is_yawning, mar_value
+    
+    
     def detect_drowsiness_vit(self, frame):
         """
         Detect drowsiness using Vision Transformer
@@ -217,6 +310,14 @@ class DrowsinessDetector:
                 print(f"  Max EAR: {np.max(self.ear_history):.3f}")
                 print(f"  Std Dev: {np.std(self.ear_history):.3f}")
             
+            if self.mar_history:
+                print(f"\nMouth Aspect Ratio Statistics:")
+                print(f"  Average MAR: {np.mean(self.mar_history):.3f}")
+                print(f"  Min MAR: {np.min(self.mar_history):.3f}")
+                print(f"  Max MAR: {np.max(self.mar_history):.3f}")
+                print(f"  Std Dev: {np.std(self.mar_history):.3f}")
+                print(f"  Total Yawns: {self.total_yawns}")
+            
             if self.vit_confidence_history:
                 print(f"\nViT Confidence Statistics:")
                 print(f"  Average Confidence: {np.mean(self.vit_confidence_history):.3f}")
@@ -239,7 +340,8 @@ class DrowsinessDetector:
         print("\n" + "="*60 + "\n")
     
     
-    def draw_statistics_overlay(self, frame, ear_value, vit_prob, is_drowsy, fps):
+    def draw_statistics_overlay(self, frame, ear_value, vit_prob, is_drowsy, fps,
+                                    mar_value=0.0, is_yawning=False):
         """
         Draw statistics overlay on the frame
         
@@ -254,9 +356,9 @@ class DrowsinessDetector:
         overlay = frame.copy()
         height, width = frame.shape[:2]
         
-        # Stats panel dimensions
+        # Stats panel dimensions (taller to fit yawn stats)
         panel_width = 300
-        panel_height = 250
+        panel_height = 340
         panel_x = width - panel_width - 10
         panel_y = 10
         
@@ -282,10 +384,13 @@ class DrowsinessDetector:
         # Store history for accuracy calculation
         if len(self.ear_history) > 100:
             self.ear_history.pop(0)
+        if len(self.mar_history) > 100:
+            self.mar_history.pop(0)
         if len(self.vit_confidence_history) > 100:
             self.vit_confidence_history.pop(0)
         
         self.ear_history.append(ear_value)
+        self.mar_history.append(mar_value)
         self.vit_confidence_history.append(vit_prob)
         
         # Calculate average confidence
@@ -342,6 +447,33 @@ class DrowsinessDetector:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         y_offset += line_height
         
+        # --- Yawn section ---
+        y_offset += 5  # small gap
+        cv2.line(frame, (panel_x + 10, y_offset - 5), (panel_x + panel_width - 10, y_offset - 5),
+                 (100, 100, 100), 1)  # separator
+        y_offset += line_height // 2
+        
+        # MAR value with bar
+        cv2.putText(frame, f"MAR: {mar_value:.3f}", (panel_x + 10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        bar_length = int(min(mar_value / 1.0, 1.0) * 150)
+        bar_color = (0, 165, 255) if mar_value > self.MAR_THRESHOLD else (0, 255, 0)
+        cv2.rectangle(frame, (panel_x + 120, y_offset - 10),
+                     (panel_x + 120 + bar_length, y_offset), bar_color, -1)
+        y_offset += line_height
+        
+        # Yawn state
+        yawn_text = "YAWNING" if is_yawning else "No Yawn"
+        yawn_color = (0, 165, 255) if is_yawning else (0, 255, 0)
+        cv2.putText(frame, f"Yawn: {yawn_text}", (panel_x + 10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, yawn_color, 1)
+        y_offset += line_height
+        
+        # Total yawns count
+        cv2.putText(frame, f"Total Yawns: {self.total_yawns}", (panel_x + 10, y_offset),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        y_offset += line_height
+        
         # Total frames
         cv2.putText(frame, f"Frames: {self.total_frames}", (panel_x + 10, y_offset),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -372,7 +504,9 @@ class DrowsinessDetector:
         fps_counter = 0
         fps = 0
         current_ear = 0.0
+        current_mar = 0.0
         current_vit_prob = 0.0
+        is_yawning = False
         
         while True:
             ret, frame = cap.read()
@@ -401,6 +535,11 @@ class DrowsinessDetector:
                 right_ear = eye_aspect_ratio(right_eye)
                 current_ear = (left_ear + right_ear) / 2.0
             
+            # Yawn detection
+            frame, is_yawning, current_mar = self.detect_yawn(frame)
+            if is_yawning:
+                self.yawn_frames += 1
+            
             # ViT-based detection
             if use_vit:
                 current_vit_prob, vit_class = self.detect_drowsiness_vit(frame)
@@ -409,8 +548,8 @@ class DrowsinessDetector:
                 vit_drowsy = False
                 current_vit_prob = 0.0
             
-            # Combined decision (either method detects drowsiness)
-            is_drowsy = ear_drowsy or vit_drowsy
+            # Combined decision (any method detects drowsiness / fatigue)
+            is_drowsy = ear_drowsy or vit_drowsy or is_yawning
             
             if is_drowsy:
                 self.drowsy_frames += 1
@@ -418,8 +557,12 @@ class DrowsinessDetector:
                 # Large warning text
                 cv2.putText(frame, "*** DROWSINESS ALERT! ***", (10, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-                cv2.putText(frame, "*** WAKE UP! ***", (10, 110),
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
+                if is_yawning:
+                    cv2.putText(frame, "*** YAWN DETECTED - STAY ALERT! ***", (10, 110),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+                else:
+                    cv2.putText(frame, "*** WAKE UP! ***", (10, 110),
+                               cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
             else:
                 self.alert_frames += 1
             
@@ -432,7 +575,8 @@ class DrowsinessDetector:
             
             # Draw statistics overlay
             if show_stats:
-                frame = self.draw_statistics_overlay(frame, current_ear, current_vit_prob, is_drowsy, fps)
+                frame = self.draw_statistics_overlay(frame, current_ear, current_vit_prob,
+                                                     is_drowsy, fps, current_mar, is_yawning)
             else:
                 # Just show FPS if stats are hidden
                 cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
@@ -463,8 +607,3 @@ if __name__ == "__main__":
     
     # Run detection on webcam (0) or video file path
     detector.run(video_source=0, use_vit=True)
-
-import os
-
-print("Model exists:", os.path.exists(vit_model_path))
-print("Model path:", vit_model_path)
